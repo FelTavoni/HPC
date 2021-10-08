@@ -8,35 +8,38 @@
 #define V 1500.0f // wave velocity v = 1500 m/s
 #define HALF_LENGTH 1 // radius of the stencil
 
+#define NUM_THREAD_BLOCK_X 16 
+#define NUM_THREAD_BLOCK_Y 16
+
+__constant__ float dxSquared = DX * DX;
+__constant__ float dySquared = DY * DY;
+__constant__ float dtSquared = DT * DT;
+
 __global__ void calcWavelet(int* d_rows, 
                             int* d_cols, 
                             float* d_prev_base, 
                             float* d_next_base, 
-                            float* d_vel_base, 
-                            float* d_dxSquared,
-                            float* d_dySquared,
-                            float* d_dtSquared,
-                            int* d_half_length) {
+                            float* d_vel_base) {
     
     // Thread index.
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
-    int idx = 0;
+    int idx = i * (*d_cols) + j;
 
-    if ((i >= (*d_half_length)) && (j >= (*d_half_length)) && (i < (*d_rows)-(*d_half_length)) && (j < (*d_cols)-(*d_half_length))) {
-        
-        idx = i * (*d_rows) + j;
+    // printf("Hi! I'm thread (%d, %d)\n", i, j);
+
+    if ( ((i >= HALF_LENGTH) && (i < ((*d_rows)-HALF_LENGTH))) && 
+         ((j >= HALF_LENGTH) && (j < ((*d_cols)-HALF_LENGTH))) ) {
     
-        // Neighbors in the horizontal direction
-        float value = (d_prev_base[idx + 1] - 2.0 * d_prev_base[idx] + d_prev_base[idx - 1]) / (*d_dxSquared);
-        
-        // Neighbors in the vertical direction
-        value += (d_prev_base[idx + (*d_cols)] - 2.0 * d_prev_base[idx] + d_prev_base[idx - (*d_cols)]) / (*d_dySquared);
-        
-        value *= (*d_dtSquared) * d_vel_base[idx];
-        
-        d_next_base[idx] = 2.0 * d_prev_base[idx] - d_next_base[idx] + value;
-
+            //neighbors in the horizontal direction
+            float value = (d_prev_base[idx + 1] - (2.0 * d_prev_base[idx]) + d_prev_base[idx - 1]) / dxSquared;
+            
+            //neighbors in the vertical direction
+            value += (d_prev_base[idx + (*d_cols)] - (2.0 * d_prev_base[idx]) + d_prev_base[idx - (*d_cols)]) / dySquared;
+            
+            value *= (dtSquared * d_vel_base[idx]);
+            
+            d_next_base[idx] = (2.0 * d_prev_base[idx]) - d_next_base[idx] + value;
     }
 
 }
@@ -77,7 +80,7 @@ void onDevice(int h_rows, int h_cols, int h_iterations, float *h_prev_base, floa
     int *d_rows, *d_cols;
     float *d_prev_base, *d_next_base, *d_vel_base;
 
-    // cudaError_t err;
+    cudaError_t err;
 
     cudaMalloc((void**)&d_rows, sizeof(int));
 	cudaMemcpy(d_rows, &h_rows, sizeof(int), cudaMemcpyHostToDevice);
@@ -95,22 +98,6 @@ void onDevice(int h_rows, int h_cols, int h_iterations, float *h_prev_base, floa
     // if (err != cudaSuccess) 
     //     printf("Error: %s\n", cudaGetErrorString(err));
 
-    // Mapping variables in device that will be used in calculus.
-    float *d_dxSquared, *d_dySquared, *d_dtSquared;
-    float dxSquared = DX * DX;
-    float dySquared = DY * DY;
-    float dtSquared = DT * DT;
-    cudaMalloc((void**)&d_dxSquared, sizeof(float));
-	cudaMemcpy(d_dxSquared, &dxSquared, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMalloc((void**)&d_dySquared, sizeof(float));
-	cudaMemcpy(d_dySquared, &dySquared, sizeof(float), cudaMemcpyHostToDevice);
-    cudaMalloc((void**)&d_dtSquared, sizeof(float));
-	cudaMemcpy(d_dtSquared, &dtSquared, sizeof(float), cudaMemcpyHostToDevice);
-
-    int* d_half_length;
-    cudaMalloc((void**)&d_half_length, sizeof(int));
-	cudaMemset(d_half_length, HALF_LENGTH, sizeof(int));
-
     // Number of threads to calculate the wavelet on the the grid.
 	dim3 threadsPerBlock(8, 4, 1); // 32 threads < 1 warp!
 	dim3 blocksPerGrid(ceil((double)h_rows/8), ceil((double)h_cols/4), 1);
@@ -121,13 +108,21 @@ void onDevice(int h_rows, int h_cols, int h_iterations, float *h_prev_base, floa
     for(int n = 0; n < h_iterations; n++) {
 
         // Launch kernel
-        calcWavelet<<<blocksPerGrid, threadsPerBlock>>>(d_rows, d_cols, d_prev_base, d_next_base, d_vel_base, d_dxSquared, d_dySquared, d_dtSquared, d_half_length);
+        calcWavelet<<<blocksPerGrid, threadsPerBlock>>>(d_rows, d_cols, d_prev_base, d_next_base, d_vel_base);
         cudaDeviceSynchronize();
+
+        err = cudaGetLastError();
+		if (err != cudaSuccess) 
+			printf("Error: %s\n", cudaGetErrorString(err));
+        // save_grid(h_rows, h_cols, h_next_base);
         
         // swap arrays for next iteration
-        float* swap = d_next_base;
+        float *swap = d_next_base;
         d_next_base = d_prev_base;
         d_prev_base = swap;
+
+        // printf("d_prev_base -> %p\n", d_prev_base);
+        // printf("d_next_base -> %p\n\n", d_next_base);
         
     }
 
@@ -140,9 +135,6 @@ void onDevice(int h_rows, int h_cols, int h_iterations, float *h_prev_base, floa
     cudaFree(d_prev_base);
     cudaFree(d_next_base);
     cudaFree(d_vel_base);
-    cudaFree(d_dxSquared);
-    cudaFree(d_dySquared);
-    cudaFree(d_dtSquared);
 
 }
 
@@ -175,7 +167,8 @@ void onHost(int argc, char* argv[]) {
 
     // represent the matrix of velocities as an array
     float *h_vel_base = (float*)malloc(h_rows * h_cols * sizeof(float));
-    memset(h_vel_base, V * V, h_rows * h_cols * sizeof(float));
+    for (int i = 0; i < h_rows * h_cols; i++)
+        h_vel_base[i] = V  * V;
 
     printf("Grid Sizes: %d x %d\n", h_rows, h_cols);
     printf("Iterations: %d\n", h_iterations);

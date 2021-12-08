@@ -8,9 +8,7 @@
 
 ### ⚙️ Adjustments and improvements
 
-This project still under development and the next updates will be aiming the following tasks:
-
-- [ ] CUDA returned a answer different from the sequential code. Maybe it's a precision problem.
+No adjustments or improvements for the moment.
 
 ## 💻 Prerequisites
 

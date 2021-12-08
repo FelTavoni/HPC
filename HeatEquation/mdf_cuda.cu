@@ -25,7 +25,8 @@ __global__ void mdf_heat_once(double*  __restrict__ u0,
 								const double* deltaT,
 								const double* alpha,
 								const double* inErr,
-								const double* boundaries){
+								const double* boundaries,
+								int* heated){
 
 	const unsigned int z = blockIdx.x * blockDim.x + threadIdx.x;
 	const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -73,30 +74,14 @@ __global__ void mdf_heat_once(double*  __restrict__ u0,
 
 		// printf("(%d, %d, %d) is %lf\n", z, y, x, u1[z + ((*npZ) * y) + ((*npZ) * (*npY) * x)]);
 
-	}
-
-}
-
-__global__ void mdf_heat_check(double*  __restrict__ u0, 
-								double*  __restrict__ u1, 
-								const unsigned int* npX, 
-								const unsigned int* npY, 
-								const unsigned int* npZ,
-								const double* inErr,
-								const double* boundaries,
-								volatile int* heated){
-
-	const unsigned int x = blockIdx.x * blockDim.x + threadIdx.x;
-	const unsigned int y = blockIdx.y * blockDim.y + threadIdx.y;
-	const unsigned int z = blockIdx.z * blockDim.z + threadIdx.z;
-
-	// If all the positions are heated more than 100, finish the iteration.
-	double err = 0.0f;
-	if ((z < (*npZ)) && (y < (*npY)) && (x < (*npX))) {
+		// If all the positions are heated more than 100, finish the iteration.
+		double err = 0.0f;
 		err = fabs(u0[z + (*npY) * (y + (*npX) * x)] - (*boundaries));
-		if (err <= (*inErr))
+		if (err > (*inErr))
 			*heated = 0;
+
 	}
+
 }
 
 int onDevice(unsigned int h_npX, unsigned int h_npY, unsigned int h_npZ, double h_deltaH, double h_deltaT, double h_alpha, double h_boundaries, double h_inErr) {
@@ -109,12 +94,9 @@ int onDevice(unsigned int h_npX, unsigned int h_npY, unsigned int h_npZ, double 
 		cudaGetDeviceProperties(&prop, i);
 		printf("Device Number: %d\n", i);
 		printf("  Device name: %s\n", prop.name);
-		printf("  Memory Clock Rate (KHz): %d\n",
-			prop.memoryClockRate);
-		printf("  Memory Bus Width (bits): %d\n",
-			prop.memoryBusWidth);
-		printf("  Peak Memory Bandwidth (GB/s): %f\n\n",
-			2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
+		printf("  Memory Clock Rate (KHz): %d\n", prop.memoryClockRate);
+		printf("  Memory Bus Width (bits): %d\n", prop.memoryBusWidth);
+		printf("  Peak Memory Bandwidth (GB/s): %f\n\n", 2.0*prop.memoryClockRate*(prop.memoryBusWidth/8)/1.0e6);
   	}
 
 	// Allocate variables in the GPU and copy they content from host.
@@ -156,21 +138,26 @@ int onDevice(unsigned int h_npX, unsigned int h_npY, unsigned int h_npZ, double 
 	cudaMemset((void**)d_u1, 0x00, h_npZ * h_npY * h_npX * sizeof(double));
 
 	double steps = 0;
-	int *heated = (int*)malloc(sizeof(int)); 
-	(*heated) = 1;
-	int *d_heated;
-	cudaMalloc((void**)&d_heated, sizeof(int));
+
+	// hasError
+    int *heated;
+    cudaMallocManaged((void**)&heated, sizeof(int), cudaMemAttachGlobal);
+    (*heated) = 0;
 
 	// Defining the grid.
 	dim3 threadsPerBlock(4, 4, 4); // 4 * 4 * 4 = 64 threads = 2 warps!
 	dim3 blocksPerGrid(ceil( (double)h_npZ/4), ceil( (double)h_npY/4), ceil( (double)h_npX/4));
 
-	while (*heated) {
+	// While not heated...
+	while (!(*heated)) {
 
 		steps++;
+		// Set `heated` to 1. If some thread indicates that has not reached the heat value, this value is going to be changed again to zero, thus recalculating the 
+		//	grid once more.
+		(*heated) = 1;
 		
 		// Calling the kernel for heat function.
-		mdf_heat_once<<<blocksPerGrid, threadsPerBlock>>>(d_u0, d_u1, d_npX, d_npY, d_npZ, d_deltaH, d_deltaT, d_alpha, d_inErr, d_boundaries);
+		mdf_heat_once<<<blocksPerGrid, threadsPerBlock>>>(d_u0, d_u1, d_npX, d_npY, d_npZ, d_deltaH, d_deltaT, d_alpha, d_inErr, d_boundaries, heated);
 		cudaDeviceSynchronize();
 
 		err = cudaGetLastError();
@@ -182,14 +169,6 @@ int onDevice(unsigned int h_npX, unsigned int h_npY, unsigned int h_npZ, double 
 		d_u0 = d_u1;
 		d_u1 = ptr;
 
-		// Let's assume the cube is heated. We'll assure that by checking every position searching if there's a spot that
-		//	has not been heated enough.
-		(*heated) = 1;
-		cudaMemcpy(d_heated, heated, sizeof(int), cudaMemcpyHostToDevice);
-		mdf_heat_check<<<blocksPerGrid, threadsPerBlock>>>(d_u0, d_u1, d_npX, d_npY, d_npZ, d_inErr, d_boundaries, d_heated);
-		cudaDeviceSynchronize();
-		cudaMemcpy(heated, d_heated, sizeof(int), cudaMemcpyDeviceToHost);
-
 	}
 
 	printf("Steps: %.1lf\n", steps);
@@ -199,14 +178,15 @@ int onDevice(unsigned int h_npX, unsigned int h_npY, unsigned int h_npZ, double 
 }
 
 int onHost() {
-	// Define variables to be used in the process
-	double h_deltaT = 0.0f; //0.01;
-	double h_deltaH =0.0f;  //0.25f;
-	double h_sizeX = 0.0f;  //1.0f;
-	double h_sizeY = 0.0f;  //1.0f;
-	double h_sizeZ = 0.0f;  //1.0f;
 
-	// Some constants defined in the description.
+	// Define variables to be used in the process
+	double h_deltaT = 0.0f; //
+	double h_deltaH = 0.0f; //
+	double h_sizeX = 0.0f;  // Block size in x-axis
+	double h_sizeY = 0.0f;  // Block size in y-axis
+	double h_sizeZ = 0.0f;  // Block size in z-axis
+
+	// Some constants defined in the problem description.
 	double h_boundaries = 100.0f;
 	double h_inErr = 1e-15;
 
@@ -220,7 +200,7 @@ int onHost() {
 	fscanf(stdin, "%lf", &h_sizeY);
 	fscanf(stdin, "%lf", &h_sizeX);
 
-	// Calculate ne number of elements in x, y and z axis.
+	// Calculates the number of points in x, y and z axis.
 	unsigned int h_npX = (unsigned int) (h_sizeX / h_deltaH);
 	unsigned int h_npY = (unsigned int) (h_sizeY / h_deltaH);
 	unsigned int h_npZ = (unsigned int) (h_sizeZ / h_deltaH);
@@ -229,14 +209,16 @@ int onHost() {
 
 	h_alpha = h_deltaT / (h_deltaH * h_deltaH);
 
-	// Call the device to calculate the heating.
+	// Call the device to calculate the heating.s
 	onDevice(h_npX, h_npY, h_npZ, h_deltaH, h_deltaT, h_alpha, h_boundaries, h_inErr);
-	// mdf_heat(h_u0, h_u1, h_npX, h_npY, h_npZ, h_deltaH, h_deltaT, 1e-15, 100.0f);
-	//mdf_print(u1,  npX, npY, npZ);
+	// mdf_print(u1,  npX, npY, npZ);
 
 	return EXIT_SUCCESS;
+
 }
 
-int main (int argc, char *argv[]){
+int main (int argc, char *argv[]) {
+	
 	return onHost();
+
 }
